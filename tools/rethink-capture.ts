@@ -6,7 +6,7 @@
 // with the byte stream — the raw material for field inference.
 //
 // Usage:
-//   tsx tools/rethink-capture.ts [--cloud] [--state <path>] <mgmt-host[:port]> <device-uuid> [out.jsonl]
+//   tsx tools/rethink-capture.ts [--cloud] [--state <path>] <mgmt-host[:port] | ws[s]://host[:port]> <device-uuid> [out.jsonl]
 //
 // The /device WS is served on the management port (default 44401). It emits
 //   {rx, injected, type} = device->cloud (fromDevice),  {tx, injected, type} = cloud->device (toDevice),
@@ -44,12 +44,15 @@ for (let i = 0; i < argv.length; i++) {
 const [hostArg, deviceId, outArg] = positionals
 if (!hostArg || !deviceId) {
     console.error(
-        'Usage: tsx tools/rethink-capture.ts [--cloud] [--state <path>] <mgmt-host[:port]> <device-uuid> [out.jsonl]',
+        'Usage: tsx tools/rethink-capture.ts [--cloud] [--state <path>] <mgmt-host[:port] | ws[s]://host[:port]> <device-uuid> [out.jsonl]',
     )
     process.exit(1)
 }
 
-const host = hostArg.includes(':') ? hostArg : `${hostArg}:44401`
+// A full ws:// or wss:// base is used as given, for a management UI behind a TLS reverse proxy.
+const base = /^wss?:\/\//.test(hostArg)
+    ? hostArg.replace(/\/+$/, '')
+    : `ws://${hostArg.includes(':') ? hostArg : `${hostArg}:44401`}`
 const out = outArg ?? `capture-${deviceId}-${Date.now()}.jsonl`
 const stream = fs.createWriteStream(out, { flags: 'a' })
 
@@ -96,12 +99,19 @@ function recordWire(dir: 'fromDevice' | 'toDevice', type: 'packet' | 'ack', raw:
     }
 }
 
-const url = `ws://${host}/device?id=${encodeURIComponent(deviceId)}`
+const url = `${base}/device?id=${encodeURIComponent(deviceId)}`
 console.error(`Connecting to ${url}\nWriting capture to ${out}`)
 
 const ws = new WebSocket(url)
 
-ws.on('open', () => emit({ k: 'marker', phase: 'connected' }))
+// Reverse proxies in front of the management UI close idle WebSockets (nginx: 60-90 s), and an
+// appliance can stay silent far longer than that between panel interactions.
+const KEEPALIVE_MS = 30_000
+let keepalive: NodeJS.Timeout | undefined
+ws.on('open', () => {
+    emit({ k: 'marker', phase: 'connected' })
+    keepalive = setInterval(() => ws.ping(), KEEPALIVE_MS)
+})
 
 ws.on('message', (data: WebSocket.RawData) => {
     let msg: any
@@ -118,6 +128,7 @@ ws.on('message', (data: WebSocket.RawData) => {
 })
 
 ws.on('close', () => {
+    clearInterval(keepalive)
     emit({ k: 'marker', phase: 'disconnected' })
     stream.end()
     process.exit(0)
